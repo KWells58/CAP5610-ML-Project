@@ -1,9 +1,25 @@
 """
-Compute quick statistics for DBPedia-14.
+dataset_stats.py
 
-Usage:
-    python dataset_stats.py
-    python dataset_stats.py --sample-size 20000
+Purpose
+-------
+This script computes basic statistics for the DBPedia dataset.
+
+Why this matters
+----------------
+Understanding the dataset helps us verify:
+- the number of samples
+- class distribution
+- average document length
+
+These statistics are useful for:
+- validating dataset integrity
+- writing the project report
+- understanding model performance later
+
+How to run
+----------
+python dataset_stats.py
 """
 
 from __future__ import annotations
@@ -72,6 +88,8 @@ def main() -> None:
     y_train = train["label"]
     y_test = test["label"]
 
+    # Combine the title and content fields into a single text input.
+    # Most text classification models expect one input string per sample.
     sampled_texts = [
         combine_text(train[i]["title"], train[i]["content"])
         for i in range(min(args.sample_size, len(train)))
@@ -79,6 +97,8 @@ def main() -> None:
     token_lengths = [len(text.split()) for text in sampled_texts]
     char_lengths = [len(text) for text in sampled_texts]
 
+    # We only sample part of the dataset to compute statistics
+    # because computing over all 560k samples would be slower
     train_counts = Counter(y_train)
     test_counts = Counter(y_test)
 

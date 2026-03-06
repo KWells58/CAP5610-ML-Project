@@ -1,14 +1,29 @@
 """
-Shared tokenizer pipeline for deep learning models.
+tokenizer.py
 
-This script can:
-1. Build Hugging Face tokenized datasets for transformer-based models
-2. Save NumPy arrays of input_ids, attention_mask, and labels
-3. Keep everyone on the same sequence length and tokenizer config
+Purpose
+-------
+This script prepares tokenized inputs for deep learning models.
 
-Usage:
-    python preprocessing/tokenizer.py
-    python preprocessing/tokenizer.py --tokenizer-name distilbert-base-uncased --max-length 256
+Why tokenization is needed
+--------------------------
+Deep learning models such as:
+- Transformers
+- LSTMs
+- CNNs
+
+cannot process raw text strings directly.
+
+Tokenization converts text into sequences of integer IDs
+representing words or subword tokens.
+
+What this script does
+---------------------
+1. Load the DBPedia dataset
+2. Use a HuggingFace tokenizer
+3. Convert text into token IDs
+4. Pad/truncate sequences to a fixed length
+5. Save tokenized outputs for deep learning models
 """
 
 from __future__ import annotations
@@ -77,6 +92,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset = load_dbpedia(args.local_path)
+    # Load a pretrained tokenizer from HuggingFace.
+    # This handles converting text into token IDs.
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
 
     print(f"Using tokenizer: {args.tokenizer_name}")
@@ -86,6 +103,8 @@ def main() -> None:
         desc="Tokenizing dataset",
     )
 
+    # Tokenize the dataset in batches for efficiency
+    # This converts each text example into input_ids and attention_mask
     tokenized.save_to_disk(str(output_dir / "hf_tokenized_dataset"))
     tokenizer.save_pretrained(output_dir / "tokenizer_files")
 

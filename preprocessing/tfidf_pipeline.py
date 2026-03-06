@@ -1,15 +1,26 @@
 """
-Shared TF-IDF pipeline for traditional ML models.
+tfidf_pipeline.py
 
-This script:
-1. Loads DBPedia-14
-2. Combines title + content into one text field
-3. Fits a TF-IDF vectorizer on train data
-4. Transforms train/test text
-5. Saves sparse matrices, labels, and vectorizer
+Purpose
+-------
+This script converts raw text into numerical feature vectors
+using TF-IDF (Term Frequency - Inverse Document Frequency).
 
-Usage:
-    python preprocessing/tfidf_pipeline.py
+Why this is needed
+------------------
+Traditional machine learning models (SVM, Logistic Regression, etc.)
+cannot work directly with raw text.
+
+TF-IDF converts text documents into numeric vectors representing
+how important words are in each document.
+
+What this script does
+---------------------
+1. Load the DBPedia dataset
+2. Combine title + content fields
+3. Build a TF-IDF vocabulary from the training data
+4. Transform train and test text into feature vectors
+5. Save the resulting matrices for use by ML models
 """
 
 from __future__ import annotations
@@ -96,6 +107,8 @@ def main() -> None:
     y_train = np.array(train["label"], dtype=np.int64)
     y_test = np.array(test["label"], dtype=np.int64)
 
+    # Create the TF-IDF vectorizer.
+    # This converts text into numerical features based on word frequency.
     vectorizer = TfidfVectorizer(
         lowercase=True,
         stop_words="english",
@@ -105,15 +118,21 @@ def main() -> None:
         sublinear_tf=args.sublinear_tf,
     )
 
+    # Fit the vectorizer on the training data only.
+    # This builds the vocabulary and IDF weights.
     print("Fitting TF-IDF vectorizer on training data...")
     X_train = vectorizer.fit_transform(train_texts)
 
+    # Apply the same transformation to the test set.
+    # IMPORTANT: we do NOT fit on test data to avoid data leakage.
     print("Transforming test data...")
     X_test = vectorizer.transform(test_texts)
 
     print(f"X_train shape: {X_train.shape}")
     print(f"X_test shape : {X_test.shape}")
 
+    # Save the processed matrices so all team members can load them
+    # instead of recomputing TF-IDF every time.
     save_npz(output_dir / "X_train.npz", X_train)
     save_npz(output_dir / "X_test.npz", X_test)
     np.save(output_dir / "y_train.npy", y_train)

@@ -1,9 +1,26 @@
 """
-Download and optionally cache the DBPedia-14 dataset locally.
+download_dataset.py
 
-Usage:
-    python data/download_dataset.py
-    python data/download_dataset.py --save-csv
+Purpose
+-------
+This script downloads the DBPedia-14 dataset using the HuggingFace `datasets` library.
+
+Why we use this script
+----------------------
+We do NOT store datasets directly in the GitHub repository because:
+1. Datasets can be large
+2. Git repositories should mainly store code
+3. Each team member can generate the dataset locally
+
+What this script does
+---------------------
+1. Downloads the DBPedia dataset
+2. Saves it locally so we don't need to re-download it every run
+3. Optionally exports the dataset to CSV for inspection
+
+How to run
+----------
+python data/download_dataset.py
 """
 
 from __future__ import annotations
@@ -51,10 +68,14 @@ def main() -> None:
     save_disk_dir.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Downloading dataset: {args.dataset_name}")
+
+    # load_dataset automatically downloads the dataset from HuggingFace
     dataset = load_dataset(args.dataset_name, cache_dir=str(cache_dir))
     print(dataset)
 
     print(f"Saving Hugging Face dataset to: {save_disk_dir}")
+    
+    # save the dataset locally so future runs load from disk instead of downloading again
     dataset.save_to_disk(str(save_disk_dir))
 
     if args.save_csv:
