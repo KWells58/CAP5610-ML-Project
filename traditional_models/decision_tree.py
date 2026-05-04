@@ -20,18 +20,17 @@ subsampling so experiments can run in a reasonable amount of time.
 How to run
 ----------
 python -m traditional_models.decision_tree
-
-Example with tuning:
-python -m traditional_models.decision_tree --max-depth 20 --min-samples-split 10 --train-limit 50000
 """
 
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
 from scipy.sparse import load_npz
+from sklearn.metrics import confusion_matrix, log_loss
 from sklearn.tree import DecisionTreeClassifier
 
 from evaluation.metrics import evaluate_classification, print_metrics
@@ -55,13 +54,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="gini",
         choices=["gini", "entropy", "log_loss"],
-        help="Function used to measure the quality of a split.",
+        help="Default split criterion. The autorun experiment loop below will compare gini and entropy.",
     )
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=20,
-        help="Maximum depth of the Decision Tree. Use None for an unconstrained tree.",
+        default=10,
+        help="Default maximum depth when running only one model. The autorun experiment loop below tests several values.",
     )
     parser.add_argument(
         "--min-samples-split",
@@ -113,11 +112,8 @@ def load_data(data_dir: str) -> tuple:
     """
     data_path = Path(data_dir)
 
-    # These are sparse matrices saved by scipy.sparse.save_npz
     X_train = load_npz(data_path / "X_train.npz")
     X_test = load_npz(data_path / "X_test.npz")
-
-    # Labels are saved as NumPy arrays
     y_train = np.load(data_path / "y_train.npy")
     y_test = np.load(data_path / "y_test.npy")
 
@@ -148,6 +144,115 @@ def maybe_subsample_training_data(X_train, y_train, train_limit: int, random_sta
     return X_subset, y_subset
 
 
+def safe_divide(a: float, b: float) -> float:
+    """
+    Tiny helper so our overfitting ratio does not crash on division by zero.
+    """
+    return a / b if b != 0 else 0.0
+
+
+def run_single_experiment(X_train_used, y_train_used, X_test, y_test, criterion, max_depth, min_samples_split,
+                          min_samples_leaf, max_features, random_state):
+    """
+    Train one Decision Tree configuration and return everything we need.
+
+    We keep train and test metrics because overfitting is easiest to spot
+    when training scores are much stronger than test scores.
+    """
+    model = DecisionTreeClassifier(
+        criterion=criterion,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        random_state=random_state,
+    )
+
+    train_start = time.perf_counter()
+    model.fit(X_train_used, y_train_used)
+    train_seconds = time.perf_counter() - train_start
+
+    y_train_pred = model.predict(X_train_used)
+    y_test_pred = model.predict(X_test)
+
+    train_metrics = evaluate_classification(y_train_used, y_train_pred)
+    test_metrics = evaluate_classification(y_test, y_test_pred)
+
+    # Decision trees can give probabilities, which lets us compute log loss.
+    # We align labels explicitly so sklearn does not guess the class order.
+    y_test_proba = model.predict_proba(X_test)
+    class_labels = model.classes_
+    test_log_loss = log_loss(y_test, y_test_proba, labels=class_labels)
+
+    result = {
+        "criterion": criterion,
+        "max_depth": max_depth,
+        "train_time_sec": train_seconds,
+        "train_accuracy": train_metrics.get("accuracy"),
+        "train_macro_f1": train_metrics.get("macro_f1"),
+        "test_accuracy": test_metrics.get("accuracy"),
+        "test_macro_f1": test_metrics.get("macro_f1"),
+        "test_log_loss": test_log_loss,
+        "tree_depth": model.get_depth(),
+        "n_leaves": model.get_n_leaves(),
+        "model": model,
+        "y_test_pred": y_test_pred,
+    }
+
+    return result
+
+
+def print_experiment_summary(results: list[dict]) -> None:
+    """
+    Print a compact comparison table for all experiment runs.
+    """
+    print("\nExperiment Summary")
+    print("-" * 110)
+    header = (
+        f"{'criterion':<10} {'max_depth':<10} {'train_time':<12} "
+        f"{'train_acc':<10} {'train_f1':<10} {'test_acc':<10} "
+        f"{'test_f1':<10} {'log_loss':<10} {'depth':<8} {'leaves':<8}"
+    )
+    print(header)
+    print("-" * 110)
+
+    for r in results:
+        depth_label = str(r["max_depth"])
+        print(
+            f"{r['criterion']:<10} {depth_label:<10} {r['train_time_sec']:<12.4f} "
+            f"{r['train_accuracy']:<10.4f} {r['train_macro_f1']:<10.4f} {r['test_accuracy']:<10.4f} "
+            f"{r['test_macro_f1']:<10.4f} {r['test_log_loss']:<10.4f} {r['tree_depth']:<8} {r['n_leaves']:<8}"
+        )
+
+
+def print_confusion_matrix(y_test, y_pred, class_names=None) -> None:
+    """
+    Print the confusion matrix in plain text so it is easy to paste into a report.
+    """
+    cm = confusion_matrix(y_test, y_pred)
+    print("\nConfusion Matrix")
+    print("-" * 40)
+
+    if class_names is not None:
+        print("Labels:", class_names)
+
+    print(cm)
+
+
+def print_log_loss_summary(results: list[dict]) -> None:
+    """
+    Print a smaller matrix-style summary focused only on log loss.
+    This is useful because log loss is often requested separately in reports.
+    """
+    print("\nLog Loss Summary")
+    print("-" * 40)
+    print(f"{'criterion':<10} {'max_depth':<10} {'test_log_loss':<14}")
+    print("-" * 40)
+
+    for r in results:
+        print(f"{r['criterion']:<10} {str(r['max_depth']):<10} {r['test_log_loss']:<14.4f}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -169,66 +274,146 @@ def main() -> None:
     print(f"Using training subset shape: {X_train_used.shape}")
 
     # ------------------------------------------------------------
-    # 3. Build the Decision Tree model
+    # 3. Convert max_features string if needed
     # ------------------------------------------------------------
-    # TODO: Try several values for max_depth and compare macro F1.
-    # Good starting values to test: 10, 20, 30, None
-    #
-    # TODO: Try criterion="gini" and criterion="entropy" and compare results.
-    #
-    # TODO: Write down whether the tree appears to overfit
-    # (for example: very strong training behavior but weaker test results).
-
-    # Convert the max_features string if needed.
     # argparse gives us strings, but sklearn accepts None, "sqrt", or "log2".
     max_features = args.max_features
     if max_features == "None":
         max_features = None
 
-    model = DecisionTreeClassifier(
-        criterion=args.criterion,
-        max_depth=args.max_depth,
-        min_samples_split=args.min_samples_split,
-        min_samples_leaf=args.min_samples_leaf,
-        max_features=max_features,
-        random_state=args.random_state,
+    # ------------------------------------------------------------
+    # 4. Autorun experiment loop
+    # ------------------------------------------------------------
+    # These are the values your assignment notes specifically told you to try.
+    depths_to_test = [10, 20, 30, None]
+    criteria_to_test = ["gini", "entropy"]
+
+    results = []
+
+    print("\nRunning Decision Tree experiments...")
+    print("-" * 40)
+
+    for criterion in criteria_to_test:
+        for max_depth in depths_to_test:
+            print(f"Now training: criterion={criterion}, max_depth={max_depth}")
+
+            result = run_single_experiment(
+                X_train_used=X_train_used,
+                y_train_used=y_train_used,
+                X_test=X_test,
+                y_test=y_test,
+                criterion=criterion,
+                max_depth=max_depth,
+                min_samples_split=args.min_samples_split,
+                min_samples_leaf=args.min_samples_leaf,
+                max_features=max_features,
+                random_state=args.random_state,
+            )
+
+            results.append(result)
+
+    # ------------------------------------------------------------
+    # 5. Sort so the strongest test macro F1 appears first
+    # ------------------------------------------------------------
+    results.sort(key=lambda r: r["test_macro_f1"], reverse=True)
+
+    # ------------------------------------------------------------
+    # 6. Print the experiment comparison table
+    # ------------------------------------------------------------
+    print_experiment_summary(results)
+    print_log_loss_summary(results)
+
+    # ------------------------------------------------------------
+    # 7. Show the best model in more detail
+    # ------------------------------------------------------------
+    best_result = results[0]
+    best_model = best_result["model"]
+    best_y_test_pred = best_result["y_test_pred"]
+
+    print("\nBest Model")
+    print("-" * 40)
+    print(f"criterion               : {best_result['criterion']}")
+    print(f"requested max_depth     : {best_result['max_depth']}")
+    print(f"actual tree depth       : {best_result['tree_depth']}")
+    print(f"number of leaves        : {best_result['n_leaves']}")
+    print(f"training time (seconds) : {best_result['train_time_sec']:.4f}")
+    print(f"train accuracy          : {best_result['train_accuracy']:.4f}")
+    print(f"train macro F1          : {best_result['train_macro_f1']:.4f}")
+    print(f"test accuracy           : {best_result['test_accuracy']:.4f}")
+    print(f"test macro F1           : {best_result['test_macro_f1']:.4f}")
+    print(f"test log loss           : {best_result['test_log_loss']:.4f}")
+    print(f"number of input features: {X_train.shape[1]}")
+
+    # ------------------------------------------------------------
+    # 8. Print full metrics for the best model on the test set
+    # ------------------------------------------------------------
+    best_test_metrics = evaluate_classification(y_test, best_y_test_pred)
+
+    print("\nBest Model Test Metrics")
+    print("-" * 40)
+    print_metrics(best_test_metrics)
+
+    # ------------------------------------------------------------
+    # 9. Confusion matrix for the best model
+    # ------------------------------------------------------------
+    print_confusion_matrix(y_test, best_y_test_pred, class_names=best_model.classes_)
+
+    # ------------------------------------------------------------
+    # 10. Simple overfitting signal
+    # ------------------------------------------------------------
+    f1_gap = best_result["train_macro_f1"] - best_result["test_macro_f1"]
+    f1_ratio = safe_divide(best_result["train_macro_f1"], best_result["test_macro_f1"])
+
+    print("\nOverfitting Check")
+    print("-" * 40)
+    print(f"Train macro F1 - Test macro F1 = {f1_gap:.4f}")
+    print(f"Train macro F1 / Test macro F1 = {f1_ratio:.4f}")
+
+    if f1_gap > 0.10:
+        print("Observation: The tree shows signs of overfitting.")
+    else:
+        print("Observation: Overfitting is not severe based on macro F1 gap alone.")
+
+    # ------------------------------------------------------------
+    # 11. Short written analysis scaffold for the report
+    # ------------------------------------------------------------
+    # This prints a rough interpretation directly into your terminal output
+    # so you can copy it into your report and polish it.
+    fastest = min(results, key=lambda r: r["train_time_sec"])
+    deepest = max(results, key=lambda r: r["tree_depth"])
+
+    print("\nShort Analysis Notes")
+    print("-" * 40)
+
+    if best_result["train_time_sec"] < 5:
+        speed_note = "The best model trained quickly."
+    elif best_result["train_time_sec"] < 30:
+        speed_note = "The best model trained at a moderate speed."
+    else:
+        speed_note = "The best model trained slowly."
+
+    print(f"- Training speed: {speed_note}")
+    print(
+        f"- Limiting the training set likely helped because only {X_train_used.shape[0]} "
+        f"training examples were used instead of {X_train.shape[0]}, which reduces runtime."
     )
-
-    # ------------------------------------------------------------
-    # 4. Train the model
-    # ------------------------------------------------------------
-    print("Training Decision Tree...")
-    model.fit(X_train_used, y_train_used)
-
-    # ------------------------------------------------------------
-    # 5. Predict on the test set
-    # ------------------------------------------------------------
-    print("Generating predictions...")
-    y_pred = model.predict(X_test)
-
-    # ------------------------------------------------------------
-    # 6. Evaluate using the shared metrics helper
-    # ------------------------------------------------------------
-    metrics = evaluate_classification(y_test, y_pred)
-
-    print("\nDecision Tree Results")
-    print("-" * 40)
-    print_metrics(metrics)
-
-    # ------------------------------------------------------------
-    # 7. Useful extra info for analysis/writeup
-    # ------------------------------------------------------------
-    print("\nAdditional Model Info")
-    print("-" * 40)
-    print(f"Tree depth              : {model.get_depth()}")
-    print(f"Number of leaves        : {model.get_n_leaves()}")
-    print(f"Number of input features: {X_train.shape[1]}")
-
-    # TODO: Add a short written analysis for the report:
-    # - Did the model train quickly or slowly?
-    # - Did limiting the training set help?
-    # - How did depth affect performance?
-    # - Why might Decision Trees struggle on sparse text features?
+    print(
+        f"- Depth effect: deeper trees usually fit training data more aggressively. "
+        f"In these runs, the best test macro F1 came from criterion={best_result['criterion']} "
+        f"with max_depth={best_result['max_depth']}."
+    )
+    print(
+        "- Sparse text issue: Decision Trees struggle with TF-IDF text because the feature space is "
+        "very high-dimensional and mostly zeros, so splits can become highly specific and fail to generalize."
+    )
+    print(
+        f"- Fastest run: criterion={fastest['criterion']}, max_depth={fastest['max_depth']}, "
+        f"time={fastest['train_time_sec']:.4f}s."
+    )
+    print(
+        f"- Deepest learned tree: criterion={deepest['criterion']}, requested max_depth={deepest['max_depth']}, "
+        f"actual depth={deepest['tree_depth']}."
+    )
 
 
 if __name__ == "__main__":
