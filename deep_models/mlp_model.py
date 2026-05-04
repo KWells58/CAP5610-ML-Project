@@ -11,45 +11,41 @@ Why this file exists
 An MLP is a neural network made of fully connected layers. In this project,
 it serves as the deep learning model paired with the Decision Tree.
 
-Important note
---------------
-This baseline uses sklearn's MLPClassifier, which is a good starting point
-for quick experimentation. If time permits, this can later be extended to
-a PyTorch implementation.
+What changed in this version
+----------------------------
+1. The training subset is now split into train + validation.
+2. Hyperparameter selection is done using validation metrics, not test metrics.
+3. After selecting the best configuration, the model is retrained on the full
+   training subset and evaluated once on the test set.
+4. A CSV file and a short text summary are saved for easier reporting.
 
-How to run
-----------
-python -m deep_models.mlp_model
-
-Example with tuning:
-python deep_models.mlp_model --hidden-layers 256,128 --max-iter 20 --train-limit 100000
+Recommended run
+---------------
+python -m deep_models.mlp_model --max-train-samples 20000 --val-size 0.2
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import time
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.sparse import load_npz
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, log_loss
+from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
 
 from evaluation.metrics import evaluate_classification, print_metrics
 
 
-def parse_hidden_layers(hidden_layers_str: str) -> tuple[int, ...]:
-    """
-    Convert a comma-separated string like '256,128' into a tuple (256, 128).
-
-    sklearn expects hidden_layer_sizes to be a tuple of integers.
-    """
-    return tuple(int(x.strip()) for x in hidden_layers_str.split(",") if x.strip())
-
-
 def parse_args() -> argparse.Namespace:
     """
-    Parse command-line arguments so hidden layer sizes and training settings
-    can be changed without editing the source code each time.
+    Parse command-line arguments.
+
+    These settings apply to all experiments in the loop below.
     """
     parser = argparse.ArgumentParser(description="Train and evaluate an MLP on TF-IDF features.")
 
@@ -58,19 +54,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="data/processed/tfidf",
         help="Directory containing X_train.npz, X_test.npz, y_train.npy, and y_test.npy.",
-    )
-    parser.add_argument(
-        "--hidden-layers",
-        type=str,
-        default="256,128",
-        help="Comma-separated hidden layer sizes. Example: 256,128",
-    )
-    parser.add_argument(
-        "--activation",
-        type=str,
-        default="relu",
-        choices=["identity", "logistic", "tanh", "relu"],
-        help="Activation function for the hidden layer.",
     )
     parser.add_argument(
         "--learning-rate-init",
@@ -91,24 +74,19 @@ def parse_args() -> argparse.Namespace:
         help="Mini-batch size used by the optimizer.",
     )
     parser.add_argument(
-        "--max-iter",
+        "--max-train-samples",
         type=int,
-        default=20,
-        help="Maximum number of training epochs/iterations.",
-    )
-    parser.add_argument(
-        "--early-stopping",
-        action="store_true",
-        help="Use early stopping based on validation score.",
-    )
-    parser.add_argument(
-        "--train-limit",
-        type=int,
-        default=100000,
+        default=20000,
         help=(
             "Optional cap on training examples used. "
-            "This helps speed up experiments while still giving a strong baseline."
+            "Lowering this makes experiments finish much faster."
         ),
+    )
+    parser.add_argument(
+        "--val-size",
+        type=float,
+        default=0.2,
+        help="Fraction of the training subset reserved for validation.",
     )
     parser.add_argument(
         "--random-state",
@@ -116,16 +94,19 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for reproducibility.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="mlp_outputs",
+        help="Directory where plots and summaries will be saved.",
+    )
 
     return parser.parse_args()
 
 
 def load_data(data_dir: str) -> tuple:
     """
-    Load the preprocessed TF-IDF matrices and labels from disk.
-
-    These files are created by:
-        python preprocessing/tfidf_pipeline.py
+    Load the TF-IDF matrices and labels from disk.
     """
     data_path = Path(data_dir)
 
@@ -137,20 +118,18 @@ def load_data(data_dir: str) -> tuple:
     return X_train, X_test, y_train, y_test
 
 
-def maybe_subsample_training_data(X_train, y_train, train_limit: int, random_state: int):
+def maybe_subsample_training_data(X_train, y_train, max_train_samples: int, random_state: int):
     """
-    Optionally use a subset of the training data.
+    Use only part of the training set so the experiment loop remains practical.
 
-    Why this helps
-    --------------
-    Training a neural network on the full 560k dataset can take longer,
-    especially for debugging and early experimentation.
+    With MLPs on sparse TF-IDF features, the full dataset can take a long time,
+    so subsampling is a reasonable tradeoff for an assignment baseline.
     """
-    if train_limit is None or train_limit >= X_train.shape[0]:
+    if max_train_samples is None or max_train_samples >= X_train.shape[0]:
         return X_train, y_train
 
     rng = np.random.default_rng(random_state)
-    indices = rng.choice(X_train.shape[0], size=train_limit, replace=False)
+    indices = rng.choice(X_train.shape[0], size=max_train_samples, replace=False)
 
     X_subset = X_train[indices]
     y_subset = y_train[indices]
@@ -158,11 +137,292 @@ def maybe_subsample_training_data(X_train, y_train, train_limit: int, random_sta
     return X_subset, y_subset
 
 
+def split_train_validation(X_train_used, y_train_used, val_size: float, random_state: int):
+    """
+    Split the training subset into a fit set and a validation set.
+
+    Stratifying matters here because text datasets can have uneven class counts,
+    and we want validation to represent the same label mix as training.
+    """
+    X_train_final, X_val, y_train_final, y_val = train_test_split(
+        X_train_used,
+        y_train_used,
+        test_size=val_size,
+        random_state=random_state,
+        stratify=y_train_used,
+    )
+
+    return X_train_final, X_val, y_train_final, y_val
+
+
+def build_mlp_model(
+    hidden_layer_sizes,
+    activation,
+    early_stopping,
+    max_iter,
+    alpha,
+    batch_size,
+    learning_rate_init,
+    random_state,
+) -> MLPClassifier:
+    """
+    Build one sklearn MLPClassifier from a set of hyperparameters.
+
+    Pulling this into its own function avoids repeating the same block twice:
+    once during validation experiments and again for final test evaluation.
+    """
+    return MLPClassifier(
+        hidden_layer_sizes=hidden_layer_sizes,
+        activation=activation,
+        solver="adam",
+        alpha=alpha,
+        batch_size=batch_size,
+        learning_rate_init=learning_rate_init,
+        max_iter=max_iter,
+        early_stopping=early_stopping,
+        random_state=random_state,
+        verbose=False,
+    )
+
+
+def run_single_experiment(
+    X_train_used,
+    y_train_used,
+    X_val,
+    y_val,
+    hidden_layer_sizes,
+    activation,
+    early_stopping,
+    max_iter,
+    alpha,
+    batch_size,
+    learning_rate_init,
+    random_state,
+):
+    """
+    Train one MLP configuration and evaluate it on validation data.
+
+    The key idea is that validation, not test, should decide which settings win.
+    """
+    model = build_mlp_model(
+        hidden_layer_sizes=hidden_layer_sizes,
+        activation=activation,
+        early_stopping=early_stopping,
+        max_iter=max_iter,
+        alpha=alpha,
+        batch_size=batch_size,
+        learning_rate_init=learning_rate_init,
+        random_state=random_state,
+    )
+
+    train_start = time.perf_counter()
+    model.fit(X_train_used, y_train_used)
+    train_seconds = time.perf_counter() - train_start
+
+    y_train_pred = model.predict(X_train_used)
+    y_val_pred = model.predict(X_val)
+
+    train_metrics = evaluate_classification(y_train_used, y_train_pred)
+    val_metrics = evaluate_classification(y_val, y_val_pred)
+
+    # Probabilities are needed for log loss, which gives a softer error view
+    # than plain accuracy alone.
+    y_val_proba = model.predict_proba(X_val)
+    val_log_loss = log_loss(y_val, y_val_proba, labels=model.classes_)
+
+    # sklearn exposes the final loss as loss_ in most versions.
+    final_loss = getattr(model, "loss_", getattr(model, "loss", None))
+
+    return {
+        "hidden_layers": hidden_layer_sizes,
+        "activation": activation,
+        "early_stopping": early_stopping,
+        "max_iter": max_iter,
+        "train_time_sec": train_seconds,
+        "n_iter": model.n_iter_,
+        "final_loss": final_loss,
+        "train_accuracy": train_metrics.get("accuracy"),
+        "train_macro_f1": train_metrics.get("macro_f1"),
+        "val_accuracy": val_metrics.get("accuracy"),
+        "val_macro_f1": val_metrics.get("macro_f1"),
+        "val_log_loss": val_log_loss,
+    }
+
+
+def print_experiment_summary(results: list[dict]) -> None:
+    """
+    Print a compact comparison table for all validation runs.
+    """
+    print("\nExperiment Summary (ranked by validation macro F1)")
+    print("-" * 155)
+
+    header = (
+        f"{'hidden_layers':<16} {'activation':<10} {'early_stop':<12} {'max_iter':<10} "
+        f"{'train_time':<12} {'n_iter':<8} {'train_acc':<10} {'train_f1':<10} "
+        f"{'val_acc':<10} {'val_f1':<10} {'val_log_loss':<12}"
+    )
+    print(header)
+    print("-" * 155)
+
+    for r in results:
+        print(
+            f"{str(r['hidden_layers']):<16} {r['activation']:<10} {str(r['early_stopping']):<12} {r['max_iter']:<10} "
+            f"{r['train_time_sec']:<12.4f} {r['n_iter']:<8} {r['train_accuracy']:<10.4f} {r['train_macro_f1']:<10.4f} "
+            f"{r['val_accuracy']:<10.4f} {r['val_macro_f1']:<10.4f} {r['val_log_loss']:<12.4f}"
+        )
+
+
+def save_experiment_results_csv(results: list[dict], output_path: Path) -> None:
+    """
+    Save all experiment results to CSV so the numbers are easy to reuse in a report.
+    """
+    fieldnames = [
+        "hidden_layers",
+        "activation",
+        "early_stopping",
+        "max_iter",
+        "train_time_sec",
+        "n_iter",
+        "final_loss",
+        "train_accuracy",
+        "train_macro_f1",
+        "val_accuracy",
+        "val_macro_f1",
+        "val_log_loss",
+    ]
+
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for r in results:
+            row = r.copy()
+            row["hidden_layers"] = str(row["hidden_layers"])
+            writer.writerow(row)
+
+
+def save_confusion_matrix_image(y_test, y_pred, output_path: Path) -> None:
+    """
+    Save the confusion matrix image for the final best model on the test set.
+    """
+    cm = confusion_matrix(y_test, y_pred)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(ax=ax, values_format="d", colorbar=True)
+    ax.set_title("MLP Confusion Matrix (Test Set)")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_log_loss_matrix_image(results: list[dict], output_path: Path) -> None:
+    """
+    Save a comparison image showing validation log loss across all experiment runs.
+
+    Rows = hidden layer settings
+    Columns = early stopping / max_iter combinations
+    """
+    row_labels = sorted({str(r["hidden_layers"]) for r in results})
+    col_labels = []
+
+    for r in results:
+        label = f"ES={r['early_stopping']}\niter={r['max_iter']}"
+        if label not in col_labels:
+            col_labels.append(label)
+
+    matrix = np.full((len(row_labels), len(col_labels)), np.nan)
+
+    row_index = {label: i for i, label in enumerate(row_labels)}
+    col_index = {label: i for i, label in enumerate(col_labels)}
+
+    for r in results:
+        row_label = str(r["hidden_layers"])
+        col_label = f"ES={r['early_stopping']}\niter={r['max_iter']}"
+        matrix[row_index[row_label], col_index[col_label]] = r["val_log_loss"]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    im = ax.imshow(matrix, aspect="auto")
+
+    ax.set_xticks(np.arange(len(col_labels)))
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_xticklabels(col_labels)
+    ax.set_yticklabels(row_labels)
+
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            if not np.isnan(matrix[i, j]):
+                ax.text(j, i, f"{matrix[i, j]:.4f}", ha="center", va="center")
+
+    ax.set_title("Validation Log Loss Matrix")
+    ax.set_xlabel("Early Stopping / Max Iter")
+    ax.set_ylabel("Hidden Layers")
+    fig.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def safe_divide(a: float, b: float) -> float:
+    """
+    Avoid division-by-zero in the overfitting ratio.
+    """
+    return a / b if b != 0 else 0.0
+
+
+def save_best_model_summary(
+    output_path: Path,
+    best_result: dict,
+    test_metrics: dict,
+    test_log_loss_value: float,
+    f1_gap: float,
+    f1_ratio: float,
+    n_input_features: int,
+    n_output_classes: int,
+) -> None:
+    """
+    Save a short plain-text report so your best run is documented outside the terminal.
+    """
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write("Best MLP Model Summary\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"hidden_layer_sizes        : {best_result['hidden_layers']}\n")
+        f.write(f"activation                : {best_result['activation']}\n")
+        f.write(f"early_stopping            : {best_result['early_stopping']}\n")
+        f.write(f"requested max_iter        : {best_result['max_iter']}\n")
+        f.write(f"actual training iterations: {best_result['n_iter']}\n")
+        f.write(f"training time (seconds)   : {best_result['train_time_sec']:.4f}\n")
+        f.write(f"validation accuracy       : {best_result['val_accuracy']:.4f}\n")
+        f.write(f"validation macro F1       : {best_result['val_macro_f1']:.4f}\n")
+        f.write(f"validation log loss       : {best_result['val_log_loss']:.4f}\n")
+        f.write(f"test accuracy             : {test_metrics.get('accuracy', 0.0):.4f}\n")
+        f.write(f"test macro F1             : {test_metrics.get('macro_f1', 0.0):.4f}\n")
+        f.write(f"test log loss             : {test_log_loss_value:.4f}\n")
+
+        if best_result["final_loss"] is not None:
+            f.write(f"final training loss       : {best_result['final_loss']:.6f}\n")
+        else:
+            f.write("final training loss       : not available in this sklearn version\n")
+
+        f.write(f"number of input features  : {n_input_features}\n")
+        f.write(f"number of output classes  : {n_output_classes}\n")
+        f.write(f"Train macro F1 - Test macro F1 = {f1_gap:.4f}\n")
+        f.write(f"Train macro F1 / Test macro F1 = {f1_ratio:.4f}\n")
+
+        if f1_gap > 0.10:
+            f.write("Observation: The MLP shows signs of overfitting.\n")
+        else:
+            f.write("Observation: Overfitting is not severe based on macro F1 gap alone.\n")
+
+
 def main() -> None:
     args = parse_args()
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # ------------------------------------------------------------
-    # 1. Load the shared TF-IDF features
+    # 1. Load data
     # ------------------------------------------------------------
     X_train, X_test, y_train, y_test = load_data(args.data_dir)
 
@@ -170,90 +430,223 @@ def main() -> None:
     print(f"Full X_test shape : {X_test.shape}")
 
     # ------------------------------------------------------------
-    # 2. Optionally use a smaller training set for faster experiments
+    # 2. Use a smaller training subset for practical runtime
     # ------------------------------------------------------------
     X_train_used, y_train_used = maybe_subsample_training_data(
-        X_train, y_train, args.train_limit, args.random_state
+        X_train, y_train, args.max_train_samples, args.random_state
     )
 
     print(f"Using training subset shape: {X_train_used.shape}")
 
     # ------------------------------------------------------------
-    # 3. Parse hidden layer sizes from command line
+    # 3. Split subset into train + validation
     # ------------------------------------------------------------
-    hidden_layer_sizes = parse_hidden_layers(args.hidden_layers)
-    print(f"Hidden layer sizes: {hidden_layer_sizes}")
+    X_train_final, X_val, y_train_final, y_val = split_train_validation(
+        X_train_used, y_train_used, args.val_size, args.random_state
+    )
+
+    print(f"Final train shape         : {X_train_final.shape}")
+    print(f"Validation shape          : {X_val.shape}")
 
     # ------------------------------------------------------------
-    # 4. Build the MLP model
+    # 4. Assignment-friendly experiment grid
     # ------------------------------------------------------------
-    # TODO: Try several hidden layer settings.
-    # Suggested values:
-    # - 128
-    # - 256,128
-    # - 512,256
-    #
-    # TODO: Compare activation="relu" versus activation="tanh".
-    #
-    # TODO: Try early_stopping on and off, then compare results.
-    #
-    # TODO: Record how changing max_iter affects performance.
+    hidden_layer_options = [(128,), (256, 128)]
+    activation_options = ["relu"]
+    early_stopping_options = [False, True]
+    max_iter_options = [10, 20, 30, 50]
 
-    model = MLPClassifier(
-        hidden_layer_sizes=hidden_layer_sizes,
-        activation=args.activation,
-        solver="adam",
+    print("\nRunning MLP experiments...")
+    print("-" * 40)
+
+    results = []
+
+    for hidden_layers in hidden_layer_options:
+        for activation in activation_options:
+            for early_stopping in early_stopping_options:
+                for max_iter in max_iter_options:
+                    print(
+                        f"Now training: hidden_layers={hidden_layers}, activation={activation}, "
+                        f"early_stopping={early_stopping}, max_iter={max_iter}"
+                    )
+
+                    result = run_single_experiment(
+                        X_train_used=X_train_final,
+                        y_train_used=y_train_final,
+                        X_val=X_val,
+                        y_val=y_val,
+                        hidden_layer_sizes=hidden_layers,
+                        activation=activation,
+                        early_stopping=early_stopping,
+                        max_iter=max_iter,
+                        alpha=args.alpha,
+                        batch_size=args.batch_size,
+                        learning_rate_init=args.learning_rate_init,
+                        random_state=args.random_state,
+                    )
+
+                    results.append(result)
+
+    # ------------------------------------------------------------
+    # 5. Rank by validation macro F1
+    # ------------------------------------------------------------
+    results.sort(key=lambda r: r["val_macro_f1"], reverse=True)
+
+    print_experiment_summary(results)
+
+    csv_path = output_dir / "mlp_experiment_results.csv"
+    save_experiment_results_csv(results, csv_path)
+
+    # ------------------------------------------------------------
+    # 6. Best validation model details
+    # ------------------------------------------------------------
+    best_result = results[0]
+
+    print("\nBest Validation Model")
+    print("-" * 40)
+    print(f"hidden_layer_sizes        : {best_result['hidden_layers']}")
+    print(f"activation                : {best_result['activation']}")
+    print(f"early_stopping            : {best_result['early_stopping']}")
+    print(f"requested max_iter        : {best_result['max_iter']}")
+    print(f"actual training iterations: {best_result['n_iter']}")
+    print(f"training time (seconds)   : {best_result['train_time_sec']:.4f}")
+    print(f"train accuracy            : {best_result['train_accuracy']:.4f}")
+    print(f"train macro F1            : {best_result['train_macro_f1']:.4f}")
+    print(f"validation accuracy       : {best_result['val_accuracy']:.4f}")
+    print(f"validation macro F1       : {best_result['val_macro_f1']:.4f}")
+    print(f"validation log loss       : {best_result['val_log_loss']:.4f}")
+
+    if best_result["final_loss"] is not None:
+        print(f"final training loss       : {best_result['final_loss']:.6f}")
+    else:
+        print("final training loss       : not available in this sklearn version")
+
+    print(f"number of input features  : {X_train.shape[1]}")
+    print(f"number of output classes  : {len(np.unique(y_train))}")
+
+    # ------------------------------------------------------------
+    # 7. Retrain best config on the full training subset
+    # ------------------------------------------------------------
+    # This is the clean evaluation step: once the validation winner is chosen,
+    # train that exact setup on all available training-subset data, then test once.
+    best_model = build_mlp_model(
+        hidden_layer_sizes=best_result["hidden_layers"],
+        activation=best_result["activation"],
+        early_stopping=best_result["early_stopping"],
+        max_iter=best_result["max_iter"],
         alpha=args.alpha,
         batch_size=args.batch_size,
         learning_rate_init=args.learning_rate_init,
-        max_iter=args.max_iter,
-        early_stopping=args.early_stopping,
         random_state=args.random_state,
-        verbose=True,  # helpful while training so we can see progress
     )
 
-    # ------------------------------------------------------------
-    # 5. Train the model
-    # ------------------------------------------------------------
-    print("Training MLP...")
-    model.fit(X_train_used, y_train_used)
+    final_train_start = time.perf_counter()
+    best_model.fit(X_train_used, y_train_used)
+    final_train_seconds = time.perf_counter() - final_train_start
 
-    # ------------------------------------------------------------
-    # 6. Predict on the test set
-    # ------------------------------------------------------------
-    print("Generating predictions...")
-    y_pred = model.predict(X_test)
+    best_y_test_pred = best_model.predict(X_test)
+    best_y_test_proba = best_model.predict_proba(X_test)
 
-    # ------------------------------------------------------------
-    # 7. Evaluate the model
-    # ------------------------------------------------------------
-    metrics = evaluate_classification(y_test, y_pred)
+    best_test_metrics = evaluate_classification(y_test, best_y_test_pred)
+    best_test_log_loss = log_loss(y_test, best_y_test_proba, labels=best_model.classes_)
 
-    print("\nMLP Results")
+    print("\nFinal Test Evaluation")
     print("-" * 40)
-    print_metrics(metrics)
+    print(f"final retrain time (seconds): {final_train_seconds:.4f}")
+    print(f"test accuracy               : {best_test_metrics.get('accuracy', 0.0):.4f}")
+    print(f"test macro F1               : {best_test_metrics.get('macro_f1', 0.0):.4f}")
+    print(f"test log loss               : {best_test_log_loss:.4f}")
 
-    # ------------------------------------------------------------
-    # 8. Useful extra information for analysis/writeup
-    # ------------------------------------------------------------
-    print("\nAdditional Model Info")
+    print("\nBest Model Test Metrics")
     print("-" * 40)
-    print(f"Number of training iterations: {model.n_iter_}")
-    print(f"Final loss value             : {model.loss_:.6f}")
-    print(f"Number of input features     : {X_train.shape[1]}")
-    print(f"Number of output classes     : {len(np.unique(y_train))}")
+    print_metrics(best_test_metrics)
 
-    # If the solver tracked the loss during training, print a few values.
-    if hasattr(model, "loss_curve_"):
-        print(f"Loss curve length            : {len(model.loss_curve_)}")
-        print(f"First loss value             : {model.loss_curve_[0]:.6f}")
-        print(f"Last loss value              : {model.loss_curve_[-1]:.6f}")
+    # ------------------------------------------------------------
+    # 8. Save images and report files
+    # ------------------------------------------------------------
+    confusion_matrix_path = output_dir / "mlp_confusion_matrix.png"
+    log_loss_matrix_path = output_dir / "mlp_validation_log_loss_matrix.png"
+    summary_txt_path = output_dir / "mlp_best_model_summary.txt"
 
-    # TODO: Add report discussion points such as:
-    # - How did the MLP compare against the Decision Tree?
-    # - Did deeper hidden layers help?
-    # - Did early stopping improve generalization?
-    # - Was training time reasonable?
+    save_confusion_matrix_image(y_test, best_y_test_pred, confusion_matrix_path)
+    save_log_loss_matrix_image(results, log_loss_matrix_path)
+
+    # ------------------------------------------------------------
+    # 9. Overfitting check
+    # ------------------------------------------------------------
+    # We compare the best run's train score against the final test score to see
+    # whether the selected configuration is learning too specifically to training data.
+    f1_gap = best_result["train_macro_f1"] - best_test_metrics.get("macro_f1", 0.0)
+    f1_ratio = safe_divide(best_result["train_macro_f1"], best_test_metrics.get("macro_f1", 0.0))
+
+    print("\nOverfitting Check")
+    print("-" * 40)
+    print(f"Train macro F1 - Test macro F1 = {f1_gap:.4f}")
+    print(f"Train macro F1 / Test macro F1 = {f1_ratio:.4f}")
+
+    if f1_gap > 0.10:
+        print("Observation: The MLP shows signs of overfitting.")
+    else:
+        print("Observation: Overfitting is not severe based on macro F1 gap alone.")
+
+    save_best_model_summary(
+        output_path=summary_txt_path,
+        best_result=best_result,
+        test_metrics=best_test_metrics,
+        test_log_loss_value=best_test_log_loss,
+        f1_gap=f1_gap,
+        f1_ratio=f1_ratio,
+        n_input_features=X_train.shape[1],
+        n_output_classes=len(np.unique(y_train)),
+    )
+
+    print("\nSaved Files")
+    print("-" * 40)
+    print(f"Experiment CSV saved to     : {csv_path}")
+    print(f"Confusion matrix saved to   : {confusion_matrix_path}")
+    print(f"Validation log loss saved to: {log_loss_matrix_path}")
+    print(f"Best model summary saved to : {summary_txt_path}")
+
+    # ------------------------------------------------------------
+    # 10. Short analysis notes
+    # ------------------------------------------------------------
+    best_no_early_stop = max(
+        (r for r in results if r["early_stopping"] is False),
+        key=lambda r: r["val_macro_f1"],
+    )
+    best_with_early_stop = max(
+        (r for r in results if r["early_stopping"] is True),
+        key=lambda r: r["val_macro_f1"],
+    )
+    fastest = min(results, key=lambda r: r["train_time_sec"])
+
+    print("\nShort Analysis Notes")
+    print("-" * 40)
+    print(
+        f"- Best hidden layers by validation: {best_result['hidden_layers']} with "
+        f"early_stopping={best_result['early_stopping']} and max_iter={best_result['max_iter']}."
+    )
+    print(
+        f"- Best with early stopping validation macro F1    : {best_with_early_stop['val_macro_f1']:.4f}"
+    )
+    print(
+        f"- Best without early stopping validation macro F1 : {best_no_early_stop['val_macro_f1']:.4f}"
+    )
+    print(
+        f"- Fastest run: hidden_layers={fastest['hidden_layers']}, "
+        f"early_stopping={fastest['early_stopping']}, max_iter={fastest['max_iter']}, "
+        f"time={fastest['train_time_sec']:.4f}s."
+    )
+    print(
+        "- Validation was used for model selection, and the test set was used only once for final evaluation."
+    )
+    print(
+        "- MLPs usually handle sparse TF-IDF better than trees because they can learn from many weak signals "
+        "across features instead of splitting on one feature at a time."
+    )
+    print(
+        "- Use the saved CSV, summary file, and plots directly in your report write-up."
+    )
 
 
 if __name__ == "__main__":
